@@ -4,20 +4,20 @@
 
 - Фон иконки — цвет панели (снимается пикселем с экрана, запасной вариант —
   системная палитра QPalette::Window).
-- Цвет графика (цвет2) — производный от фона (цвет1) в HSV: спокойный оттенок
-  и гарантированный контраст; для тёмного фона осветляем, для светлого — затемняем.
+- Цвет графика (цвет2) — цвет текста часов из текущей GTK-темы панели XFCE.
 - История 32 точки, график CPU — только линия, RAM — линия с заливкой под ней,
   обновление раз в секунду.
-- Цвета пересчитываются при каждой перерисовке, чтобы реагировать на смену
-  системной темы без перезапуска.
+- Фон и цвет графика обновляются при смене темы без перезапуска.
 - Контекстное меню «Выход» на каждой иконке.
 - Если системный трей недоступен — сообщение в stderr и выход с кодом 1.
 """
 
+import json
+from pathlib import Path
 import sys
 
 import psutil
-from PyQt5.QtCore import QRectF, QTimer, Qt
+from PyQt5.QtCore import QObject, QProcess, QRectF, QTimer, Qt
 from PyQt5.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -76,6 +76,37 @@ def computeGraphColor(oColor):
     return oColor2
 
 
+class GtkClockColors(QObject):
+    """Асинхронно получает GTK-стиль; не смешивает циклы GTK и Qt."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.color = None
+        self.buffer = b""
+        self.process = QProcess(self)
+        self.process.readyReadStandardOutput.connect(self.read_colors)
+        self.process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
+        self.process.start(sys.executable, [str(Path(__file__).with_name("gtk-colors.py"))])
+        parent.aboutToQuit.connect(self.close)
+
+    def read_colors(self):
+        self.buffer += bytes(self.process.readAllStandardOutput())
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            try:
+                rgb = json.loads(line)["foreground"]
+                if len(rgb) == 3 and all(isinstance(v, int) and 0 <= v <= 255 for v in rgb):
+                    self.color = QColor(*rgb)
+            except (ValueError, KeyError, TypeError):
+                continue
+
+    def close(self):
+        self.process.terminate()
+        if not self.process.waitForFinished(1000):
+            self.process.kill()
+            self.process.waitForFinished(1000)
+
+
 def _sampleStrip(nY, oScreen):
     """Снимает цвет горизонтальной полосы экрана на высоте nY: три точки по
     ширине, возвращает самое частое значение (r, g, b, count) или None."""
@@ -90,9 +121,6 @@ def _sampleStrip(nY, oScreen):
             continue
 
         nRed, nGreen, nBlue = oColor.red(), oColor.green(), oColor.blue()
-        if nRed > 245 and nGreen > 245 and nBlue > 245:
-            continue
-
         aSamples.append((nRed, nGreen, nBlue))
     if not aSamples:
         return None
@@ -123,6 +151,20 @@ def detectPanelColor():
         if oGeometry.height() <= PANEL_SAMPLE_Y + 1:
             return fallback
 
+        # Используем зарезервированную панелью область, если она известна X11.
+        # Иначе однотонное окно у противоположного края выигрывает при ничьей.
+        oAvailable = oScreen.availableGeometry()
+        topInset = oAvailable.top() - oGeometry.top()
+        bottomInset = oGeometry.bottom() - oAvailable.bottom()
+        if topInset > 0 and bottomInset == 0:
+            entry = _sampleStrip(min(PANEL_SAMPLE_Y, topInset // 2), oScreen)
+            if entry is not None:
+                return QColor(*entry[:3])
+        elif bottomInset > 0 and topInset == 0:
+            entry = _sampleStrip(oGeometry.height() - 1 - min(PANEL_SAMPLE_Y, bottomInset // 2), oScreen)
+            if entry is not None:
+                return QColor(*entry[:3])
+
         topStripe = _sampleStrip(PANEL_SAMPLE_Y, oScreen)
         bottomStripe = _sampleStrip(oGeometry.height() - PANEL_SAMPLE_Y - 1, oScreen)
 
@@ -145,6 +187,7 @@ class TrayMonitor(object):
     def __init__(self):
         self.cpuHistory = [0.0] * HISTORY
         self.ramHistory = [0.0] * HISTORY
+        self.gtkColors = GtkClockColors(QApplication.instance())
 
         self.pCpuTray = QSystemTrayIcon()
         self.pRamTray = QSystemTrayIcon()
@@ -175,14 +218,13 @@ class TrayMonitor(object):
         self.pCpuTray.setToolTip("CPU: {0:4.1f}%".format(self.cpuHistory[-1]))
         self.pRamTray.setToolTip("RAM: {0:4.1f}% ({1:.1f} / {2:.1f} ГБ)".format(
             self.ramHistory[-1], gb(vmem.used), gb(vmem.total)))
-        self.pCpuTray.setIcon(QIcon(self._renderIcon(self.cpuHistory, False)))
-        self.pRamTray.setIcon(QIcon(self._renderIcon(self.ramHistory, True)))
+        oBg = detectPanelColor()
+        # Контрастный расчёт нужен только до первого ответа GTK или без GTK.
+        oAccent = self.gtkColors.color or computeGraphColor(oBg)
+        self.pCpuTray.setIcon(QIcon(self._renderIcon(self.cpuHistory, False, oBg, oAccent)))
+        self.pRamTray.setIcon(QIcon(self._renderIcon(self.ramHistory, True, oBg, oAccent)))
 
-    def _renderIcon(self, values, bFill):
-        # Цвета пересчитываются при каждой перерисовке: так проект реагирует
-        # на смену системной/трейной темы на лету, без перезапуска.
-        oBg = detectPanelColor()          # цвет1 — фон трея
-        oAccent = computeGraphColor(oBg)  # цвет2 — контрастный спокойный
+    def _renderIcon(self, values, bFill, oBg, oAccent):
         pixmap = QPixmap(ICON_SIZE, ICON_SIZE)
         pixmap.fill(oBg)
         painter = QPainter(pixmap)

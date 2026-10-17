@@ -61,7 +61,15 @@ detect_display_env() {
 }
 
 monitor_pids() {
-    pgrep -f "$PATTERN" 2>/dev/null || true
+    local pid
+    local -a args
+    while read -r pid; do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || continue
+        if [[ "${args[1]:-}" == "$TRAY_SCRIPT" ]]; then
+            echo "$pid"
+        fi
+    done < <(pgrep -u "$UID" -f "$PATTERN" 2>/dev/null || true)
 }
 
 stop_monitor() {
@@ -84,17 +92,25 @@ start_monitor() {
     detect_display_env
     stop_monitor
 
-    local env_prefix=(DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" QT_QPA_PLATFORMTHEME=)
-    if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    local env_prefix=(DISPLAY="$DISPLAY" QT_QPA_PLATFORMTHEME=)
+    if [[ -n "${XAUTHORITY:-}" ]]; then
+        env_prefix+=(XAUTHORITY="$XAUTHORITY")
+    fi
+    # Ayatana's watcher does not notify XFCE about newly registered SNI icons.
+    # Isolate only this process from the session bus so Qt uses XEmbed instead.
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+    if [[ "${desktop^^}" == *XFCE* && "${XDG_SESSION_TYPE:-x11}" == x11 ]]; then
+        env_prefix+=(DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null)
+    elif [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         env_prefix+=(DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS")
     fi
 
     # QT_QPA_PLATFORMTHEME= (пусто) обязательно: тема fly перехватывает трей и иконка не появляется.
-    setsid nohup env "${env_prefix[@]}" python3 "$TRAY_SCRIPT" >"$LOG_FILE" 2>&1 < /dev/null &
+    setsid nohup env "${env_prefix[@]}" /usr/bin/python3 "$TRAY_SCRIPT" >"$LOG_FILE" 2>&1 < /dev/null &
     disown || true
     sleep 2
 
-    if monitor_pids >/dev/null; then
+    if [[ -n "$(monitor_pids)" ]]; then
         echo "Индикатор запущен: $TRAY_SCRIPT"
         echo "Лог: $LOG_FILE — должен быть пустым (нет ошибок)"
     else
@@ -106,7 +122,7 @@ install_app() {
     require_script
 
     local missing=() pkg
-    for pkg in python3-pyqt5 python3-psutil; do
+    for pkg in python3-pyqt5 python3-psutil python3-gi gir1.2-gtk-3.0; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
             missing+=("$pkg")
         fi
@@ -115,7 +131,7 @@ install_app() {
         echo "Устанавливаются пакеты: ${missing[*]}"
         sudo -E apt-get install -y "${missing[@]}"
     else
-        echo "Зависимости уже установлены: python3-pyqt5, python3-psutil"
+        echo "Зависимости уже установлены: python3-pyqt5, python3-psutil, python3-gi, gir1.2-gtk-3.0"
     fi
 
     mkdir -p "$AUTOSTART_DIR"
